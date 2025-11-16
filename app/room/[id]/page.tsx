@@ -15,6 +15,7 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
   const [peers, setPeers] = useState<Record<string, Peer>>({});
   const pcsRef = useRef<Record<string, RTCPeerConnection>>({});
   const localStreamRef = useRef<MediaStream | null>(null);
+  const [isMuted, setIsMuted] = useState(false);
 
   // Auto-detect signaling server URL
   // Pakai environment variable kalau ada (untuk production), kalau tidak pakai auto-detect
@@ -110,24 +111,68 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
         socket.on("offer", async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
           if (!socket) return;
           console.log("got offer from", from);
+
+          // Check if peer connection already exists
+          if (pcsRef.current[from]) {
+            console.warn("Peer connection already exists for:", from, "closing old one");
+            pcsRef.current[from].close();
+          }
+
           const pc = createPeerConnection(from);
           pcsRef.current[from] = pc;
 
           // add local tracks
           stream.getTracks().forEach((t) => pc.addTrack(t, stream));
 
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          socket.emit("answer", { to: from, sdp: answer });
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            console.log("Remote offer set, creating answer...");
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            console.log("Answer created, sending to:", from);
+            socket.emit("answer", { to: from, sdp: answer });
+          } catch (err) {
+            console.error("Error handling offer:", err);
+            // Clean up on error
+            pc.close();
+            delete pcsRef.current[from];
+          }
         });
 
         // 5. when receive answer
         socket.on("answer", async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
           console.log("got answer from", from);
           const pc = pcsRef.current[from];
-          if (!pc) return;
-          await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+          if (!pc) {
+            console.warn("No peer connection found for answer from:", from);
+            return;
+          }
+
+          // Check signaling state - should be "have-local-offer" to accept answer
+          // If already stable, means negotiation already completed
+          if (pc.signalingState === "stable" || pc.signalingState === "closed") {
+            console.warn("Connection already stable/closed, ignoring duplicate answer. State:", pc.signalingState);
+            return;
+          }
+
+          try {
+            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            console.log("Remote description set successfully, state:", pc.signalingState);
+          } catch (err) {
+            console.error("Error setting remote description:", err);
+            // Clean up on error
+            try {
+              pc.close();
+            } catch (closeErr) {
+              console.warn("Error closing connection:", closeErr);
+            }
+            delete pcsRef.current[from];
+            setPeers((p) => {
+              const copy = { ...p };
+              delete copy[from];
+              return copy;
+            });
+          }
         });
 
         // 6. ice-candidate
@@ -203,6 +248,23 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
     }
   }, []);
 
+  const toggleMute = () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+
+    const audioTracks = stream.getAudioTracks();
+    const newMutedState = !isMuted;
+
+    // Enable/disable all audio tracks
+    // Karena track di-share ke semua peer connections, cukup update enabled state
+    audioTracks.forEach((track) => {
+      track.enabled = !newMutedState;
+    });
+
+    setIsMuted(newMutedState);
+    console.log(`Microphone ${newMutedState ? "muted" : "unmuted"}`);
+  };
+
   const copyRoomLink = async () => {
     if (!urlInfo) return;
 
@@ -272,7 +334,27 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
       </div>
       <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
         <div>
-          <h3>Local</h3>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" }}>
+            <h3 style={{ margin: 0 }}>Local</h3>
+            <button
+              onClick={toggleMute}
+              style={{
+                padding: "6px 12px",
+                backgroundColor: isMuted ? "#ef4444" : "#10b981",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+              title={isMuted ? "Unmute microphone" : "Mute microphone"}
+            >
+              {isMuted ? "🔇 Muted" : "🎤 Unmuted"}
+            </button>
+          </div>
           <video ref={localVidRef} autoPlay muted playsInline style={{ width: 320, height: 240, backgroundColor: "#000" }} />
         </div>
 
