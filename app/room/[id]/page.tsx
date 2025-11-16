@@ -511,7 +511,18 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
               {isMuted ? "🔇 Muted" : "🎤 Unmuted"}
             </button>
           </div>
-          <video ref={localVidRef} autoPlay muted playsInline style={{ width: 320, height: 240, backgroundColor: "#000" }} />
+          <video
+            ref={localVidRef}
+            autoPlay
+            muted
+            playsInline
+            style={{
+              width: 320,
+              height: 240,
+              backgroundColor: "#000",
+              transform: "scaleX(-1)", // Mirror video (seperti cermin)
+            }}
+          />
         </div>
 
         <div>
