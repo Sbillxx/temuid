@@ -569,7 +569,12 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
                     autoPlay
                     playsInline
                     muted={false}
-                    style={{ width: 320, height: 240, backgroundColor: "#000" }}
+                    style={{
+                      width: 320,
+                      height: 240,
+                      backgroundColor: "#000",
+                      transform: "scaleX(-1)", // Mirror video (seperti cermin)
+                    }}
                   />
                 </div>
               );
