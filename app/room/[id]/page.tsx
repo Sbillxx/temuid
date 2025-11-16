@@ -43,19 +43,39 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
       // event.streams[0] adalah media remote
       const remoteStream = event.streams[0];
 
-      // Debug: Log audio tracks
+      // Debug: Log audio tracks dengan track ID untuk tracking
       const audioTracks = remoteStream.getAudioTracks();
       const videoTracks = remoteStream.getVideoTracks();
-      console.log(`Received stream from ${peerSocketId}:`, {
+      console.log(`📥 Received stream from ${peerSocketId}:`, {
+        streamId: remoteStream.id,
         audioTracks: audioTracks.length,
         videoTracks: videoTracks.length,
         audioEnabled: audioTracks.map((t) => t.enabled),
+        audioTrackIds: audioTracks.map((t) => t.id), // Track ID untuk verify tidak ter-swap
+        videoTrackIds: videoTracks.map((t) => t.id),
       });
 
-      setPeers((prev) => ({
-        ...prev,
-        [peerSocketId]: { stream: remoteStream },
-      }));
+      // CRITICAL: Jangan replace stream kalau sudah ada (prevent swap)
+      setPeers((prev) => {
+        // Jika peer sudah ada dan stream ID sama, jangan replace
+        if (prev[peerSocketId] && prev[peerSocketId].stream.id === remoteStream.id) {
+          console.log(`Stream for ${peerSocketId} already exists with same ID, keeping existing`);
+          return prev;
+        }
+
+        // Jika peer sudah ada tapi stream ID berbeda, log warning
+        if (prev[peerSocketId] && prev[peerSocketId].stream.id !== remoteStream.id) {
+          console.warn(`⚠️ Stream ID changed for ${peerSocketId}:`, {
+            old: prev[peerSocketId].stream.id,
+            new: remoteStream.id,
+          });
+        }
+
+        return {
+          ...prev,
+          [peerSocketId]: { stream: remoteStream },
+        };
+      });
     };
 
     return pc;
@@ -145,22 +165,33 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
             audioEnabled: audioTracksToAdd.map((t) => t.enabled),
           });
 
+          // Check if tracks already added to prevent duplicate
+          const existingSenders = pc.getSenders();
+          const existingAudioTrackIds = existingSenders.filter((s) => s.track?.kind === "audio").map((s) => s.track?.id);
+
           tracksToAdd.forEach((t) => {
+            // Skip if track already added (prevent duplicate)
+            if (t.kind === "audio" && existingAudioTrackIds.includes(t.id)) {
+              console.log(`  Audio track ${t.id} already added to ${socketId}, skipping`);
+              return;
+            }
+
             // Ensure track is enabled before adding
             if (t.kind === "audio") {
               t.enabled = true;
-              console.log(`  Adding audio track (enabled: ${t.enabled}) to ${socketId}`);
+              console.log(`  ➕ Adding audio track ${t.id} (enabled: ${t.enabled}) to ${socketId}`);
             }
             pc.addTrack(t, stream);
           });
 
-          // Verify tracks were added
+          // Verify tracks were added dengan track ID
           const senders = pc.getSenders();
           const audioSenders = senders.filter((s) => s.track?.kind === "audio");
-          console.log(`Tracks added to peer ${socketId} - Senders:`, {
+          console.log(`✅ Tracks added to peer ${socketId} - Senders:`, {
             total: senders.length,
             audioSenders: audioSenders.length,
-            audioTracks: audioSenders.map((s) => s.track?.id),
+            audioTrackIds: audioSenders.map((s) => s.track?.id), // Track ID untuk verify
+            localAudioTrackId: audioTracksToAdd[0]?.id, // Track ID yang kita kirim
           });
 
           // create offer
@@ -193,21 +224,33 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
             audioEnabled: audioTracksToAdd.map((t) => t.enabled),
           });
 
+          // Check if tracks already added to prevent duplicate
+          const existingSenders = pc.getSenders();
+          const existingAudioTrackIds = existingSenders.filter((s) => s.track?.kind === "audio").map((s) => s.track?.id);
+
           tracksToAdd.forEach((t) => {
+            // Skip if track already added (prevent duplicate)
+            if (t.kind === "audio" && existingAudioTrackIds.includes(t.id)) {
+              console.log(`  Audio track ${t.id} already added to ${from}, skipping`);
+              return;
+            }
+
             // Ensure track is enabled before adding
             if (t.kind === "audio") {
               t.enabled = true;
-              console.log(`  Adding audio track (enabled: ${t.enabled}) to ${from}`);
+              console.log(`  ➕ Adding audio track ${t.id} (enabled: ${t.enabled}) to ${from}`);
             }
             pc.addTrack(t, stream);
           });
 
-          // Verify tracks were added
+          // Verify tracks were added dengan track ID
           const senders = pc.getSenders();
           const audioSenders = senders.filter((s) => s.track?.kind === "audio");
-          console.log(`Tracks added (answer) to peer ${from} - Senders:`, {
+          console.log(`✅ Tracks added (answer) to peer ${from} - Senders:`, {
             total: senders.length,
             audioSenders: audioSenders.length,
+            audioTrackIds: audioSenders.map((s) => s.track?.id), // Track ID untuk verify
+            localAudioTrackId: audioTracksToAdd[0]?.id, // Track ID yang kita kirim
           });
 
           try {
