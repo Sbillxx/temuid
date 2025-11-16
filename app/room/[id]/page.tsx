@@ -7,15 +7,24 @@ let socket: ReturnType<typeof io> | null = null;
 
 interface Peer {
   stream: MediaStream;
+  videoRef?: HTMLVideoElement | null;
+  canvasRef?: HTMLCanvasElement | null;
+  isCameraOff?: boolean;
 }
 
 export default function RoomPage({ params }: { params: Promise<{ id: string }> }) {
   const { id: roomId } = use(params);
   const localVidRef = useRef<HTMLVideoElement>(null);
+  const localCanvasRef = useRef<HTMLCanvasElement>(null);
   const [peers, setPeers] = useState<Record<string, Peer>>({});
   const pcsRef = useRef<Record<string, RTCPeerConnection>>({});
   const localStreamRef = useRef<MediaStream | null>(null);
   const [isMuted, setIsMuted] = useState(false);
+  const [isCameraOff, setIsCameraOff] = useState(false);
+  const [facingMode, setFacingMode] = useState<"user" | "environment">("user"); // "user" = front, "environment" = back
+  const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  // Store video refs separately to avoid infinite loop
+  const peerVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
 
   // Auto-detect signaling server URL
   // Pakai environment variable kalau ada (untuk production), kalau tidak pakai auto-detect
@@ -44,15 +53,15 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
       const remoteStream = event.streams[0];
 
       // Debug: Log audio tracks dengan track ID untuk tracking
-      const audioTracks = remoteStream.getAudioTracks();
-      const videoTracks = remoteStream.getVideoTracks();
+      const remoteAudioTracks = remoteStream.getAudioTracks();
+      const remoteVideoTracks = remoteStream.getVideoTracks();
       console.log(`📥 Received stream from ${peerSocketId}:`, {
         streamId: remoteStream.id,
-        audioTracks: audioTracks.length,
-        videoTracks: videoTracks.length,
-        audioEnabled: audioTracks.map((t) => t.enabled),
-        audioTrackIds: audioTracks.map((t) => t.id), // Track ID untuk verify tidak ter-swap
-        videoTrackIds: videoTracks.map((t) => t.id),
+        audioTracks: remoteAudioTracks.length,
+        videoTracks: remoteVideoTracks.length,
+        audioEnabled: remoteAudioTracks.map((t) => t.enabled),
+        audioTrackIds: remoteAudioTracks.map((t) => t.id), // Track ID untuk verify tidak ter-swap
+        videoTrackIds: remoteVideoTracks.map((t) => t.id),
       });
 
       // CRITICAL: Jangan replace stream kalau sudah ada (prevent swap)
@@ -71,9 +80,47 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
           });
         }
 
+        // Initialize isCameraOff berdasarkan track state saat ini
+        const videoTracks = remoteStream.getVideoTracks();
+        const initialCameraOff = videoTracks.length === 0 || videoTracks.every((track) => !track.enabled);
+
         return {
           ...prev,
-          [peerSocketId]: { stream: remoteStream },
+          [peerSocketId]: {
+            stream: remoteStream,
+            isCameraOff: initialCameraOff,
+          },
+        };
+      });
+
+      // Monitor video track state changes untuk detect camera on/off
+      const remoteVideoTracksForMonitor = remoteStream.getVideoTracks();
+      remoteVideoTracksForMonitor.forEach((track) => {
+        // Check initial state
+        if (!track.enabled) {
+          setPeers((prev) => {
+            if (prev[peerSocketId]) {
+              return {
+                ...prev,
+                [peerSocketId]: { ...prev[peerSocketId], isCameraOff: true },
+              };
+            }
+            return prev;
+          });
+        }
+
+        // Listen for track ended event
+        track.onended = () => {
+          console.log(`Video track ended for ${peerSocketId}`);
+          setPeers((prev) => {
+            if (prev[peerSocketId]) {
+              return {
+                ...prev,
+                [peerSocketId]: { ...prev[peerSocketId], isCameraOff: true },
+              };
+            }
+            return prev;
+          });
         };
       });
     };
@@ -110,9 +157,25 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
           return;
         }
 
-        // 1. get local media
+        // 1. Get available cameras
+        try {
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const cameras = devices.filter((device) => device.kind === "videoinput");
+          setAvailableCameras(cameras);
+          console.log(
+            `📷 Found ${cameras.length} cameras:`,
+            cameras.map((c) => ({ label: c.label, deviceId: c.deviceId }))
+          );
+        } catch (err) {
+          console.warn("Failed to enumerate cameras:", err);
+        }
+
+        // 2. get local media dengan facingMode (use current facingMode state)
+        const currentFacingMode = facingMode; // Capture current value
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
+          video: {
+            facingMode: currentFacingMode, // "user" = front, "environment" = back
+          },
           audio: true,
         });
         localStreamRef.current = stream;
@@ -377,7 +440,8 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
         currentStream.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [roomId, SIGNALING_SERVER_URL]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, SIGNALING_SERVER_URL]); // facingMode tidak perlu di dependency karena flipCamera handle sendiri
 
   // Client-side only state untuk URL info (prevent hydration mismatch)
   const [urlInfo, setUrlInfo] = useState<{
@@ -404,6 +468,8 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
     }
   }, []);
 
+  // Tidak perlu monitor peer camera state - biarkan hitam saja kalau off
+
   const toggleMute = () => {
     const stream = localStreamRef.current;
     if (!stream) return;
@@ -419,6 +485,171 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
 
     setIsMuted(newMutedState);
     console.log(`Microphone ${newMutedState ? "muted" : "unmuted"}`);
+  };
+
+  const captureFrameToCanvas = () => {
+    const video = localVidRef.current;
+    const canvas = localCanvasRef.current;
+    if (!video || !canvas || video.readyState < 2) return; // Video belum ready
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    // Set canvas size sama dengan video
+    const width = video.videoWidth || 320;
+    const height = video.videoHeight || 240;
+    canvas.width = width;
+    canvas.height = height;
+
+    // Draw video frame ke canvas dengan blur effect
+    ctx.save();
+    ctx.scale(-1, 1); // Mirror horizontal
+    ctx.filter = "blur(15px)"; // Apply blur
+    ctx.drawImage(video, -width, 0, width, height);
+    ctx.restore();
+  };
+
+  const toggleCamera = () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+
+    const videoTracks = stream.getVideoTracks();
+    const newCameraOffState = !isCameraOff;
+
+    if (newCameraOffState) {
+      // Capture frame terakhir sebelum off
+      captureFrameToCanvas();
+    }
+
+    // Enable/disable all video tracks
+    videoTracks.forEach((track) => {
+      track.enabled = !newCameraOffState;
+    });
+
+    setIsCameraOff(newCameraOffState);
+    console.log(`Camera ${newCameraOffState ? "off" : "on"}`);
+  };
+
+  const flipCamera = async () => {
+    const stream = localStreamRef.current;
+    if (!stream) return;
+
+    // Check if camera is off - don't flip if off
+    if (isCameraOff) {
+      alert("Please turn on camera first before flipping!");
+      return;
+    }
+
+    // Check if multiple cameras available
+    const hasMultipleCameras = availableCameras.length > 1;
+    if (!hasMultipleCameras) {
+      alert("Only one camera available. Cannot flip.");
+      return;
+    }
+
+    try {
+      // Get old video track first
+      const oldVideoTrack = stream.getVideoTracks()[0];
+      if (!oldVideoTrack) {
+        console.error("No video track found");
+        return;
+      }
+
+      // Get new facing mode (flip between front and back)
+      const newFacingMode = facingMode === "user" ? "environment" : "user";
+
+      // Stop old track FIRST before requesting new one (prevent "Could not start video source" error)
+      oldVideoTrack.stop();
+
+      // Small delay to ensure old track is fully released
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      // Get new video stream with new facing mode
+      let newStream: MediaStream;
+      try {
+        newStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: newFacingMode,
+          },
+          audio: false, // Keep existing audio track
+        });
+      } catch (facingModeError) {
+        // If facingMode fails, try using deviceId instead
+        console.warn("facingMode failed, trying deviceId:", facingModeError);
+
+        // Find camera with different facing mode
+        const currentDeviceId = oldVideoTrack.getSettings().deviceId;
+        const otherCamera = availableCameras.find((cam) => cam.deviceId !== currentDeviceId);
+
+        if (otherCamera) {
+          newStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              deviceId: { exact: otherCamera.deviceId },
+            },
+            audio: false,
+          });
+        } else {
+          throw facingModeError;
+        }
+      }
+
+      const newVideoTrack = newStream.getVideoTracks()[0];
+      if (!newVideoTrack) {
+        console.error("Failed to get new video track");
+        newStream.getTracks().forEach((t) => t.stop()); // Cleanup
+        return;
+      }
+
+      // Remove old track from stream (already stopped)
+      stream.removeTrack(oldVideoTrack);
+
+      // Add new track to stream
+      stream.addTrack(newVideoTrack);
+
+      // Update local video element
+      if (localVidRef.current) {
+        localVidRef.current.srcObject = stream;
+      }
+
+      // Replace video track in all peer connections
+      await Promise.all(
+        Object.entries(pcsRef.current).map(async ([peerId, pc]) => {
+          const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+          if (sender) {
+            try {
+              await sender.replaceTrack(newVideoTrack);
+            } catch (err) {
+              console.error(`Failed to replace track for peer ${peerId}:`, err);
+            }
+          }
+        })
+      );
+
+      setFacingMode(newFacingMode);
+      console.log(`📷 Camera flipped to ${newFacingMode === "user" ? "front" : "back"}`);
+
+      // Cleanup newStream (tracks sudah di-add ke stream utama)
+      newStream.getTracks().forEach((t) => {
+        if (t !== newVideoTrack) t.stop(); // Stop any extra tracks
+      });
+    } catch (err) {
+      console.error("Failed to flip camera:", err);
+      alert(`Failed to flip camera: ${err instanceof Error ? err.message : "Unknown error"}\n\nPlease try again or refresh the page.`);
+
+      // Try to restore old track if possible
+      try {
+        const stream = localStreamRef.current;
+        if (stream) {
+          const videoTracks = stream.getVideoTracks();
+          if (videoTracks.length === 0) {
+            // No video track, need to reinitialize
+            console.warn("No video track after flip failure, may need to refresh");
+          }
+        }
+      } catch (restoreErr) {
+        console.error("Failed to restore camera:", restoreErr);
+      }
+    }
   };
 
   const copyRoomLink = async () => {
@@ -490,7 +721,7 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
       </div>
       <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
         <div>
-          <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px" }}>
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", marginBottom: "8px", flexWrap: "wrap" }}>
             <h3 style={{ margin: 0 }}>Local</h3>
             <button
               onClick={toggleMute}
@@ -510,19 +741,72 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
             >
               {isMuted ? "🔇 Muted" : "🎤 Unmuted"}
             </button>
+            <button
+              onClick={toggleCamera}
+              style={{
+                padding: "6px 12px",
+                backgroundColor: isCameraOff ? "#ef4444" : "#10b981",
+                color: "white",
+                border: "none",
+                borderRadius: "4px",
+                cursor: "pointer",
+                fontSize: "12px",
+                display: "flex",
+                alignItems: "center",
+                gap: "4px",
+              }}
+              title={isCameraOff ? "Turn camera on" : "Turn camera off"}
+            >
+              {isCameraOff ? "📷 Camera Off" : "📹 Camera On"}
+            </button>
+            {availableCameras.length > 1 && !isCameraOff && (
+              <button
+                onClick={flipCamera}
+                style={{
+                  padding: "6px 12px",
+                  backgroundColor: "#0070f3",
+                  color: "white",
+                  border: "none",
+                  borderRadius: "4px",
+                  cursor: "pointer",
+                  fontSize: "12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "4px",
+                }}
+                title={`Flip to ${facingMode === "user" ? "back" : "front"} camera`}
+              >
+                🔄 {facingMode === "user" ? "Back" : "Front"}
+              </button>
+            )}
           </div>
-          <video
-            ref={localVidRef}
-            autoPlay
-            muted
-            playsInline
-            style={{
-              width: 320,
-              height: 240,
-              backgroundColor: "#000",
-              transform: "scaleX(-1)", // Mirror video (seperti cermin)
-            }}
-          />
+          <div style={{ position: "relative", width: 320, height: 240 }}>
+            <video
+              ref={localVidRef}
+              autoPlay
+              muted
+              playsInline
+              style={{
+                width: 320,
+                height: 240,
+                backgroundColor: "#000",
+                transform: "scaleX(-1)", // Mirror video (seperti cermin)
+                display: isCameraOff ? "none" : "block",
+              }}
+            />
+            <canvas
+              ref={localCanvasRef}
+              style={{
+                width: 320,
+                height: 240,
+                backgroundColor: "#000",
+                position: "absolute",
+                top: 0,
+                left: 0,
+                display: isCameraOff ? "block" : "none",
+              }}
+            />
+          </div>
         </div>
 
         <div>
@@ -538,6 +822,8 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
               const audioTracks = p.stream?.getAudioTracks() || [];
               const hasAudio = audioTracks.length > 0;
               const audioEnabled = audioTracks.every((t) => t.enabled);
+              // Peer camera off - biarkan hitam saja (tidak perlu deteksi state)
+              const isPeerCameraOff = false; // Always show video, biarkan hitam kalau track disabled
 
               return (
                 <div key={id}>
@@ -545,37 +831,59 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
                     <p style={{ fontSize: "12px", margin: 0 }}>{id}</p>
                     {hasAudio && <span style={{ fontSize: "10px", color: audioEnabled ? "#10b981" : "#ef4444" }}>{audioEnabled ? "🎤" : "🔇"}</span>}
                   </div>
-                  <video
-                    ref={(el) => {
-                      if (el && p.stream) {
-                        el.srcObject = p.stream;
-                        // Unmute peer video untuk bisa dengar suara
-                        el.muted = false;
-                        el.volume = 1.0;
+                  <div style={{ position: "relative", width: 320, height: 240 }}>
+                    <video
+                      ref={(el) => {
+                        if (el && p.stream) {
+                          // Store ref tanpa setState (prevent infinite loop)
+                          peerVideoRefs.current[id] = el;
 
-                        // Debug: Log audio tracks
-                        const audioTracks = p.stream.getAudioTracks();
-                        console.log(`Peer ${id} audio tracks:`, audioTracks.length, {
-                          enabled: audioTracks.map((t) => t.enabled),
-                          muted: audioTracks.map((t) => t.muted),
-                        });
+                          // Set srcObject hanya jika belum di-set atau berbeda
+                          if (el.srcObject !== p.stream) {
+                            el.srcObject = p.stream;
+                          }
 
-                        // Force play (might need user interaction first)
-                        el.play().catch((err) => {
-                          console.warn(`Cannot play peer video ${id}:`, err);
-                        });
-                      }
-                    }}
-                    autoPlay
-                    playsInline
-                    muted={false}
-                    style={{
-                      width: 320,
-                      height: 240,
-                      backgroundColor: "#000",
-                      transform: "scaleX(-1)", // Mirror video (seperti cermin)
-                    }}
-                  />
+                          // Unmute peer video untuk bisa dengar suara
+                          el.muted = false;
+                          el.volume = 1.0;
+
+                          // Debug: Log audio tracks (hanya sekali)
+                          if (!el.dataset.logged) {
+                            const audioTracks = p.stream.getAudioTracks();
+                            console.log(`Peer ${id} audio tracks:`, audioTracks.length, {
+                              enabled: audioTracks.map((t) => t.enabled),
+                              muted: audioTracks.map((t) => t.muted),
+                            });
+                            el.dataset.logged = "true";
+                          }
+
+                          // Force play hanya jika belum playing (prevent interrupt error)
+                          if (el.paused && el.readyState >= 2) {
+                            el.play().catch((err) => {
+                              // Ignore AbortError (play request interrupted)
+                              if (err.name !== "AbortError") {
+                                console.warn(`Cannot play peer video ${id}:`, err);
+                              }
+                            });
+                          }
+                        } else if (!el) {
+                          // Cleanup
+                          delete peerVideoRefs.current[id];
+                        }
+                      }}
+                      autoPlay
+                      playsInline
+                      muted={false}
+                      style={{
+                        width: 320,
+                        height: 240,
+                        backgroundColor: "#000",
+                        transform: "scaleX(-1)", // Mirror video (seperti cermin)
+                        display: isPeerCameraOff ? "none" : "block",
+                      }}
+                    />
+                    {/* Peer camera off - biarkan hitam saja (tidak perlu placeholder) */}
+                  </div>
                 </div>
               );
             })}
