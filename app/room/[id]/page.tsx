@@ -98,6 +98,30 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
         localStreamRef.current = stream;
         if (localVidRef.current) localVidRef.current.srcObject = stream;
 
+        // Debug: Verify local stream has audio
+        const localAudioTracks = stream.getAudioTracks();
+        const localVideoTracks = stream.getVideoTracks();
+        console.log("🎤 Local stream initialized:", {
+          audioTracks: localAudioTracks.length,
+          videoTracks: localVideoTracks.length,
+          audioEnabled: localAudioTracks.map((t) => t.enabled),
+          audioSettings: localAudioTracks.map((t) => t.getSettings()),
+        });
+
+        if (localAudioTracks.length === 0) {
+          console.error("❌ ERROR: No audio tracks in local stream!");
+        } else {
+          localAudioTracks.forEach((track, idx) => {
+            console.log(`  Local audio track ${idx}:`, {
+              enabled: track.enabled,
+              muted: track.muted,
+              readyState: track.readyState,
+            });
+            // Ensure audio track is enabled
+            track.enabled = true;
+          });
+        }
+
         // 2. connect to signaling & join room
         if (!socket) return;
         socket.emit("join-room", { roomId });
@@ -109,8 +133,35 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
           const pc = createPeerConnection(socketId);
           pcsRef.current[socketId] = pc;
 
-          // add local tracks
-          stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+          // add local tracks - VERIFY audio tracks are included
+          const tracksToAdd = stream.getTracks();
+          const audioTracksToAdd = tracksToAdd.filter((t) => t.kind === "audio");
+          const videoTracksToAdd = tracksToAdd.filter((t) => t.kind === "video");
+
+          console.log(`Adding tracks to peer ${socketId}:`, {
+            total: tracksToAdd.length,
+            audio: audioTracksToAdd.length,
+            video: videoTracksToAdd.length,
+            audioEnabled: audioTracksToAdd.map((t) => t.enabled),
+          });
+
+          tracksToAdd.forEach((t) => {
+            // Ensure track is enabled before adding
+            if (t.kind === "audio") {
+              t.enabled = true;
+              console.log(`  Adding audio track (enabled: ${t.enabled}) to ${socketId}`);
+            }
+            pc.addTrack(t, stream);
+          });
+
+          // Verify tracks were added
+          const senders = pc.getSenders();
+          const audioSenders = senders.filter((s) => s.track?.kind === "audio");
+          console.log(`Tracks added to peer ${socketId} - Senders:`, {
+            total: senders.length,
+            audioSenders: audioSenders.length,
+            audioTracks: audioSenders.map((s) => s.track?.id),
+          });
 
           // create offer
           const offer = await pc.createOffer();
@@ -132,8 +183,32 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
           const pc = createPeerConnection(from);
           pcsRef.current[from] = pc;
 
-          // add local tracks
-          stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+          // add local tracks - VERIFY audio tracks are included
+          const tracksToAdd = stream.getTracks();
+          const audioTracksToAdd = tracksToAdd.filter((t) => t.kind === "audio");
+
+          console.log(`Adding tracks (answer) to peer ${from}:`, {
+            total: tracksToAdd.length,
+            audio: audioTracksToAdd.length,
+            audioEnabled: audioTracksToAdd.map((t) => t.enabled),
+          });
+
+          tracksToAdd.forEach((t) => {
+            // Ensure track is enabled before adding
+            if (t.kind === "audio") {
+              t.enabled = true;
+              console.log(`  Adding audio track (enabled: ${t.enabled}) to ${from}`);
+            }
+            pc.addTrack(t, stream);
+          });
+
+          // Verify tracks were added
+          const senders = pc.getSenders();
+          const audioSenders = senders.filter((s) => s.track?.kind === "audio");
+          console.log(`Tracks added (answer) to peer ${from} - Senders:`, {
+            total: senders.length,
+            audioSenders: audioSenders.length,
+          });
 
           try {
             await pc.setRemoteDescription(new RTCSessionDescription(sdp));
