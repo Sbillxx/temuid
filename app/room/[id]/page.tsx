@@ -41,9 +41,20 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
 
     pc.ontrack = (event) => {
       // event.streams[0] adalah media remote
+      const remoteStream = event.streams[0];
+
+      // Debug: Log audio tracks
+      const audioTracks = remoteStream.getAudioTracks();
+      const videoTracks = remoteStream.getVideoTracks();
+      console.log(`Received stream from ${peerSocketId}:`, {
+        audioTracks: audioTracks.length,
+        videoTracks: videoTracks.length,
+        audioEnabled: audioTracks.map((t) => t.enabled),
+      });
+
       setPeers((prev) => ({
         ...prev,
-        [peerSocketId]: { stream: event.streams[0] },
+        [peerSocketId]: { stream: remoteStream },
       }));
     };
 
@@ -141,37 +152,64 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
 
         // 5. when receive answer
         socket.on("answer", async ({ from, sdp }: { from: string; sdp: RTCSessionDescriptionInit }) => {
-          console.log("got answer from", from);
+          console.log("got answer from", from, "current signaling state:", pcsRef.current[from]?.signalingState);
           const pc = pcsRef.current[from];
           if (!pc) {
             console.warn("No peer connection found for answer from:", from);
             return;
           }
 
-          // Check signaling state - should be "have-local-offer" to accept answer
-          // If already stable, means negotiation already completed
-          if (pc.signalingState === "stable" || pc.signalingState === "closed") {
-            console.warn("Connection already stable/closed, ignoring duplicate answer. State:", pc.signalingState);
+          // Check signaling state - must be "have-local-offer" to accept answer
+          // If already stable, means negotiation already completed (duplicate answer)
+          if (pc.signalingState === "stable") {
+            console.log("Connection already stable, negotiation completed. Ignoring duplicate answer.");
+            return;
+          }
+
+          if (pc.signalingState === "closed") {
+            console.warn("Connection is closed, cannot set remote description");
+            return;
+          }
+
+          // Store state before narrow check
+          const initialState = pc.signalingState;
+
+          // Only accept answer if we're in "have-local-offer" state
+          if (initialState !== "have-local-offer") {
+            console.warn(`Invalid signaling state for answer: ${initialState}. Expected: have-local-offer. Ignoring.`);
             return;
           }
 
           try {
             await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-            console.log("Remote description set successfully, state:", pc.signalingState);
+            console.log("Remote description (answer) set successfully, new state:", pc.signalingState);
           } catch (err) {
-            console.error("Error setting remote description:", err);
-            // Clean up on error
-            try {
-              pc.close();
-            } catch (closeErr) {
-              console.warn("Error closing connection:", closeErr);
+            const errorMessage = err instanceof Error ? err.message : String(err);
+
+            // If error is about wrong state, it's likely a race condition - log but don't crash
+            if (errorMessage.includes("stable") || errorMessage.includes("wrong state")) {
+              console.warn("Answer arrived too late (connection already stable). This is OK, ignoring:", errorMessage);
+              return;
             }
-            delete pcsRef.current[from];
-            setPeers((p) => {
-              const copy = { ...p };
-              delete copy[from];
-              return copy;
-            });
+
+            console.error("Error setting remote description:", err);
+
+            // Check current state before cleanup (may have changed after async operation)
+            const currentState = pc.signalingState as string;
+            // Only clean up if not already in terminal states
+            if (currentState !== "stable" && currentState !== "closed") {
+              try {
+                pc.close();
+              } catch (closeErr) {
+                console.warn("Error closing connection:", closeErr);
+              }
+              delete pcsRef.current[from];
+              setPeers((p) => {
+                const copy = { ...p };
+                delete copy[from];
+                return copy;
+              });
+            }
           }
         });
 
@@ -367,19 +405,46 @@ export default function RoomPage({ params }: { params: Promise<{ id: string }> }
               gap: "8px",
             }}
           >
-            {Object.entries(peers).map(([id, p]) => (
-              <div key={id}>
-                <p style={{ fontSize: "12px", margin: "4px 0" }}>{id}</p>
-                <video
-                  ref={(el) => {
-                    if (el && p.stream) el.srcObject = p.stream;
-                  }}
-                  autoPlay
-                  playsInline
-                  style={{ width: 320, height: 240, backgroundColor: "#000" }}
-                />
-              </div>
-            ))}
+            {Object.entries(peers).map(([id, p]) => {
+              const audioTracks = p.stream?.getAudioTracks() || [];
+              const hasAudio = audioTracks.length > 0;
+              const audioEnabled = audioTracks.every((t) => t.enabled);
+
+              return (
+                <div key={id}>
+                  <div style={{ display: "flex", gap: "4px", alignItems: "center", marginBottom: "4px" }}>
+                    <p style={{ fontSize: "12px", margin: 0 }}>{id}</p>
+                    {hasAudio && <span style={{ fontSize: "10px", color: audioEnabled ? "#10b981" : "#ef4444" }}>{audioEnabled ? "🎤" : "🔇"}</span>}
+                  </div>
+                  <video
+                    ref={(el) => {
+                      if (el && p.stream) {
+                        el.srcObject = p.stream;
+                        // Unmute peer video untuk bisa dengar suara
+                        el.muted = false;
+                        el.volume = 1.0;
+
+                        // Debug: Log audio tracks
+                        const audioTracks = p.stream.getAudioTracks();
+                        console.log(`Peer ${id} audio tracks:`, audioTracks.length, {
+                          enabled: audioTracks.map((t) => t.enabled),
+                          muted: audioTracks.map((t) => t.muted),
+                        });
+
+                        // Force play (might need user interaction first)
+                        el.play().catch((err) => {
+                          console.warn(`Cannot play peer video ${id}:`, err);
+                        });
+                      }
+                    }}
+                    autoPlay
+                    playsInline
+                    muted={false}
+                    style={{ width: 320, height: 240, backgroundColor: "#000" }}
+                  />
+                </div>
+              );
+            })}
           </div>
         </div>
       </div>
